@@ -1,20 +1,23 @@
 /*
- * coke - CLI tool to disable clamshell sleep on macOS
+ * coke - CLI tool to disable sleep on macOS
  *
- * Keeps your MacBook awake when the lid is closed, without requiring
- * a power adapter, external display, or keyboard/mouse.
+ * Keeps your MacBook awake — whether the lid is open or closed —
+ * without requiring a power adapter, external display, or keyboard/mouse.
  *
  * Usage:
- *   coke          Run in foreground, disable clamshell sleep
+ *   coke          Run in foreground, disable sleep
  *   coke off      Re-enable clamshell sleep (manual cleanup)
- *   coke status   Show current clamshell state
+ *   coke status   Show current state
  *   coke version  Show version
  *
- * When coke exits (Ctrl+C, SIGTERM, crash, or any other reason), it
- * always re-enables clamshell sleep. If the lid is closed at that
- * moment, the machine will go to sleep immediately. This is
- * intentional — a laptop left awake in a bag with no display is a
- * thermal hazard.
+ * On clean exit (Ctrl+C, SIGTERM, SIGHUP), the clamshell flag is
+ * reset and the idle assertion released. If the lid is closed at
+ * that moment, the machine will go to sleep immediately — a laptop
+ * left awake in a bag with no display is a thermal hazard.
+ *
+ * On crash or SIGKILL, the idle assertion is auto-released by the
+ * kernel, but the clamshell flag remains set until coke off or
+ * reboot.
  *
  * This behavior is a consequence of the kernel design: the XNU
  * IOPMrootDomain evaluates clamshell sleep policy inline with the
@@ -24,23 +27,33 @@
  * (CDMManager) uses the same API and has the same behavior.
  *
  * How it works:
- *   IOKit API kPMSetClamshellSleepState sets the kernel's
- *   clamshellSleepDisableMask (bit kClamshellSleepDisablePowerd).
- *   The flag is globally sticky — RootDomainUserClient::clientClose
- *   does not undo it, so it persists across connection open/close.
- *   No root or entitlement required (kIOUserClientEntitlementsKey =
- *   false, no clientHasPrivilege gate on this selector).
+ *   Two mechanisms prevent sleep:
+ *
+ *   1. Clamshell sleep (lid close): IOKit API kPMSetClamshellSleepState
+ *      sets the kernel's clamshellSleepDisableMask (bit
+ *      kClamshellSleepDisablePowerd). The flag is globally sticky —
+ *      RootDomainUserClient::clientClose does not undo it, so it
+ *      persists across connection open/close. No root or entitlement
+ *      required (kIOUserClientEntitlementsKey = false, no
+ *      clientHasPrivilege gate on this selector). Re-asserted every
+ *      second to recover if another tool clears it.
+ *
+ *   2. Idle sleep (lid open): An IOPMAssertion of type
+ *      kIOPMAssertionTypePreventUserIdleSystemSleep (same as
+ *      caffeinate -i). Per-process, auto-released by the kernel on
+ *      process death — no coordination needed, no orphan risk.
  *
  * Multi-instance coordination:
  *   flock() shared/exclusive locks on a per-user temp file ensure
  *   the kernel flag is only cleared when the last instance exits.
- *   Crash recovery: flock is auto-released on process death; the
- *   next startup detects orphaned state via an exclusive lock probe.
+ *   Crash recovery: flock is auto-released on process death.
+ *   The clamshell flag may remain set until coke off or reboot.
  *
  * Safety:
- *   - Kernel state is ALWAYS reset on exit (no stale flags)
+ *   - Clean exit (Ctrl+C, SIGTERM, SIGHUP) always resets kernel state
+ *   - SIGKILL or crash leaves the clamshell flag set until coke off or reboot
  *   - Thermal throttling and emergency shutdown (SMC) remain active
- *   - Normal sleep (idle, power button, Apple menu) still works
+ *   - User-initiated sleep (power button, Apple menu) still works
  *   - State resets automatically on reboot
  */
 
@@ -102,6 +115,7 @@ static const char *get_lock_path(void)
 
     if (n < 0 || (size_t)n >= sizeof(lock_path)) {
         fprintf(stderr, "coke: lock path too long\n");
+        lock_path[0] = '\0'; /* prevent stale truncated path on next call */
         return NULL;
     }
 
@@ -207,26 +221,20 @@ static int get_clamshell_state(bool *lid_closed, bool *causes_sleep)
  * flock() shared and exclusive locks:
  *
  *   Running instance:  holds LOCK_SH for its entire lifetime.
- *   Startup cleanup:   briefly holds LOCK_EX to detect orphaned kernel
- *                      state (crashed instance left the flag set), then
- *                      atomically downgrades to LOCK_SH.
  *   Clean shutdown:    tries to upgrade LOCK_SH → LOCK_EX (non-blocking).
  *                      If it succeeds, this was the last instance — reset
  *                      the kernel flag. If it fails, other instances are
  *                      still running — do nothing.
- *   Crash recovery:    flock is released automatically when a process dies
- *                      (fd closed by kernel). The next startup's exclusive
- *                      lock probe detects the orphaned state.
+ *   Crash:             flock is released automatically when a process dies
+ *                      (fd closed by kernel). The clamshell flag remains
+ *                      set until coke off or reboot.
  *
  * Key invariant: a running instance ALWAYS holds at least LOCK_SH.
  * This guarantees that LOCK_EX succeeds only when no instances are alive.
- *
- * Lock transitions (all atomic on macOS/BSD flock):
- *   LOCK_EX → LOCK_SH  (downgrade, cleanup_orphaned_state)
- *   LOCK_SH → LOCK_EX  (upgrade, cleanup_on_exit — non-blocking)
  */
 
 static int lock_fd = -1;
+static IOPMAssertionID idle_assertion = kIOPMNullAssertionID;
 
 /*
  * Try to acquire an exclusive lock (non-blocking).
@@ -282,30 +290,24 @@ static int open_lock_file(void)
 }
 
 /*
- * Check if we're the only instance. If so, clean up any orphaned
- * kernel state from a previous crash, then downgrade to a shared lock.
- */
-static void cleanup_orphaned_state(int fd)
-{
-    if (try_exclusive_lock(fd)) {
-        /* No other instances alive. Clean up stale state. */
-        set_clamshell_sleep_disabled(false);
-        /* Atomic downgrade to shared — no gap where no lock is held */
-        if (flock(fd, LOCK_SH) != 0) {
-            fprintf(stderr, "coke: warning: failed to downgrade lock: %s\n",
-                    strerror(errno));
-        }
-    }
-}
-
-/*
- * Called on clean exit. If we're the last instance, re-enable
- * clamshell sleep.
+ * Called on clean exit (Ctrl+C, SIGTERM, SIGHUP, or atexit).
+ *
+ * The two sleep mechanisms have different cleanup needs:
+ *   - Idle assertion: per-process, released here but also auto-released
+ *     by the kernel on crash — no orphan risk.
+ *   - Clamshell flag: global, shared across instances. Only the last
+ *     instance (the one that successfully upgrades to LOCK_EX) resets it.
  */
 static void cleanup_on_exit(void)
 {
     if (lock_fd < 0)
         return;
+
+    /* Release idle sleep assertion (per-process, no coordination needed) */
+    if (idle_assertion != kIOPMNullAssertionID) {
+        IOPMAssertionRelease(idle_assertion);
+        idle_assertion = kIOPMNullAssertionID;
+    }
 
     /*
      * Try to upgrade our shared lock to exclusive (non-blocking).
@@ -331,8 +333,8 @@ static void cleanup_on_exit(void)
  * checked within ~1 second of signal delivery.
  *
  * SIGKILL cannot be caught — in that case the OS closes our fd
- * (releasing the flock), and the next startup cleans up via
- * cleanup_orphaned_state().
+ * (releasing the flock). The clamshell flag remains set until
+ * coke off or reboot.
  */
 static volatile sig_atomic_t should_exit = 0;
 
@@ -356,6 +358,12 @@ static void install_signal_handlers(void)
 
 /* ---------- Commands ---------- */
 
+/*
+ * Main entry point. Acquires a shared lock, disables clamshell sleep,
+ * creates an idle sleep assertion, then loops re-asserting the clamshell
+ * flag every second until signaled. On exit, releases the assertion and
+ * (if last instance) resets the clamshell flag.
+ */
 static int cmd_run(void)
 {
     lock_fd = open_lock_file();
@@ -367,18 +375,16 @@ static int cmd_run(void)
      * guard). cleanup_on_exit is idempotent (checks lock_fd < 0), so
      * the explicit call at the end of cmd_run + this atexit is safe. */
     atexit(cleanup_on_exit);
+    install_signal_handlers();
 
-    /* Clean up orphaned state from a previous crash.
-     * If we got the exclusive lock, it's already downgraded to shared. */
-    cleanup_orphaned_state(lock_fd);
-
-    /* Take our shared lock (no-op if cleanup_orphaned_state already holds one) */
     if (!acquire_shared_lock(lock_fd)) {
-        fprintf(stderr, "coke: failed to acquire shared lock: %s\n",
-                strerror(errno));
+        if (!should_exit) {
+            fprintf(stderr, "coke: failed to acquire shared lock: %s\n",
+                    strerror(errno));
+        }
         close(lock_fd);
         lock_fd = -1;
-        return 1;
+        return should_exit ? 0 : 1;
     }
 
     /* Disable clamshell sleep */
@@ -389,16 +395,23 @@ static int cmd_run(void)
         return 1;
     }
 
-    fprintf(stderr, "coke: clamshell sleep disabled (pid %d)\n", getpid());
+    /* Prevent idle system sleep (like caffeinate -i).
+     * Each process holds its own assertion — the kernel auto-releases
+     * it if the process dies, so no multi-instance coordination needed. */
+    ret = IOPMAssertionCreateWithName(
+        kIOPMAssertionTypePreventUserIdleSystemSleep,
+        kIOPMAssertionLevelOn,
+        CFSTR("coke: preventing idle sleep"),
+        &idle_assertion);
+    if (ret != kIOReturnSuccess) {
+        fprintf(stderr, "coke: warning: failed to create idle sleep assertion: 0x%x\n", ret);
+        /* Non-fatal: clamshell sleep prevention still works */
+    }
+
+    fprintf(stderr, "coke: sleep disabled (pid %d)\n", getpid());
     fprintf(stderr, "coke: press Ctrl+C to stop\n");
 
-    install_signal_handlers();
-
-    /*
-     * Re-assert every second. This ensures:
-     *   - Recovery if another tool flips the flag behind our back
-     *   - The shared lock is held as long as this fd is open
-     */
+    /* Re-assert every second to recover if another tool clears the flag */
     while (!should_exit) {
         sleep(1);
         if (!should_exit)
@@ -419,16 +432,16 @@ static int cmd_run(void)
 static int cmd_off(void)
 {
     int fd = open_lock_file();
-    if (fd >= 0) {
-        if (!try_exclusive_lock(fd)) {
-            close(fd);
-            fprintf(stderr, "coke: instances are still running — stop them first (kill or Ctrl+C)\n");
-            return 1;
-        }
-        /* Hold exclusive lock while we disable — prevents a new instance
-         * from starting and calling set_clamshell_sleep_disabled(true)
-         * between our check and our disable call. */
+    if (fd < 0) {
+        fprintf(stderr, "coke: warning: cannot check for running instances\n");
+    } else if (!try_exclusive_lock(fd)) {
+        close(fd);
+        fprintf(stderr, "coke: instances are still running — stop them first (kill or Ctrl+C)\n");
+        return 1;
     }
+    /* Hold exclusive lock (if acquired) while we disable — prevents a new
+     * instance from starting and calling set_clamshell_sleep_disabled(true)
+     * between our check and our disable call. */
 
     IOReturn ret = set_clamshell_sleep_disabled(false);
 
@@ -442,6 +455,11 @@ static int cmd_off(void)
     return 0;
 }
 
+/*
+ * Print current lid state, clamshell sleep override, and whether any
+ * coke instances are running. Uses the lock file to detect instances:
+ * if LOCK_EX succeeds, no instances hold LOCK_SH, so none are alive.
+ */
 static int cmd_status(void)
 {
     bool lid_closed, causes_sleep;
@@ -450,23 +468,14 @@ static int cmd_status(void)
         return 1;
     }
 
-    /* Check if any coke instances are running.
-     * Probe with a non-blocking exclusive lock. If we get it, downgrade
-     * to shared immediately — this prevents a concurrent cmd_run from
-     * grabbing exclusive in cleanup_orphaned_state() until our close(). */
+    /* Check if any coke instances are running. Probe with a non-blocking
+     * exclusive lock. Briefly holds LOCK_EX until close() — a concurrent
+     * coke startup's acquire_shared_lock would block for this duration. */
     int fd = open_lock_file();
     bool instances_running = false;
     if (fd >= 0) {
-        if (try_exclusive_lock(fd)) {
-            /* No instances running. Downgrade to shared so the lock is
-             * held right up until close(), narrowing the race window. */
-            if (flock(fd, LOCK_SH) != 0) {
-                fprintf(stderr, "coke: warning: failed to downgrade lock: %s\n",
-                        strerror(errno));
-            }
-        } else {
+        if (!try_exclusive_lock(fd))
             instances_running = true;
-        }
         close(fd);
     }
 
@@ -482,10 +491,10 @@ static int cmd_status(void)
 static void usage(void)
 {
     fprintf(stderr,
-        "coke - disable clamshell sleep on macOS\n"
+        "coke - disable sleep on macOS\n"
         "\n"
         "usage:\n"
-        "  coke             disable clamshell sleep (foreground, Ctrl+C to stop)\n"
+        "  coke             disable sleep (foreground, Ctrl+C to stop)\n"
         "  coke off         re-enable clamshell sleep\n"
         "  coke status      show current state\n"
         "  coke version     show version\n"
