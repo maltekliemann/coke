@@ -1,6 +1,6 @@
 CC = cc
 CFLAGS = -Wall -Wextra -O2
-FRAMEWORKS = -framework IOKit -framework CoreFoundation
+FRAMEWORKS = -framework IOKit -framework CoreFoundation -framework CoreGraphics
 PREFIX ?= /usr/local
 VERSION ?= dev
 
