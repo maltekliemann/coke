@@ -76,6 +76,8 @@
 #include <IOKit/pwr_mgt/IOPMLib.h>
 #include <IOKit/pwr_mgt/IOPMLibDefs.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <CoreGraphics/CoreGraphics.h>
+#include <IOKit/ps/IOPowerSources.h>
 
 #define LOCK_FILENAME "coke.lock"
 #define LOCK_PATH_MAX 256
@@ -212,6 +214,41 @@ static int get_clamshell_state(bool *lid_closed, bool *causes_sleep)
     return 0;
 }
 
+/* ---------- Environment checks ---------- */
+
+/*
+ * Returns true if at least one non-built-in (external) display is online.
+ */
+static bool has_external_display(void)
+{
+    CGDirectDisplayID displays[8];
+    uint32_t count = 0;
+
+    if (CGGetOnlineDisplayList(8, displays, &count) != kCGErrorSuccess)
+        return false;
+
+    for (uint32_t i = 0; i < count; i++) {
+        if (!CGDisplayIsBuiltin(displays[i]))
+            return true;
+    }
+    return false;
+}
+
+/*
+ * Returns true if the system is running on AC (wall) power.
+ */
+static bool is_on_ac_power(void)
+{
+    CFTypeRef info = IOPSCopyPowerSourcesInfo();
+    if (!info)
+        return false;
+
+    CFStringRef source = IOPSGetProvidingPowerSourceType(info);
+    bool ac = source && CFStringCompare(source, CFSTR(kIOPMACPowerKey), 0) == kCFCompareEqualTo;
+    CFRelease(info);
+    return ac;
+}
+
 /* ---------- flock-based coordination ---------- */
 
 /*
@@ -316,8 +353,19 @@ static void cleanup_on_exit(void)
      * the only holder, it atomically upgrades — no gap, no race.
      */
     if (try_exclusive_lock(lock_fd)) {
-        set_clamshell_sleep_disabled(false);
-        fprintf(stderr, "coke: last instance exiting, clamshell sleep re-enabled\n");
+        /*
+         * Only clear the kernel's clamshellSleepDisableMask if powerd
+         * wouldn't have it set. Powerd sets the same bit (0x02) when
+         * in desktop mode (external display + AC). Clearing it would
+         * desync powerd's internal state — it tracks the bit and won't
+         * re-send until its own state transitions zero↔non-zero.
+         */
+        if (has_external_display() && is_on_ac_power()) {
+            fprintf(stderr, "coke: last instance exiting, clamshell mode active — mask left intact\n");
+        } else {
+            set_clamshell_sleep_disabled(false);
+            fprintf(stderr, "coke: last instance exiting, clamshell sleep re-enabled\n");
+        }
     }
 
     close(lock_fd);
