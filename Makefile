@@ -17,4 +17,9 @@ uninstall:
 clean:
 	rm -f coke
 
-.PHONY: install uninstall clean
+test:
+	@set -eu; scratch=$$(mktemp -d); trap 'rm -rf "$$scratch"' EXIT; \
+	$(CC) $(CFLAGS) -o "$$scratch/coke-test" tests/fake_power.c $(FRAMEWORKS); \
+	python3 tests/test_coke.py "$$scratch/coke-test"
+
+.PHONY: install uninstall clean test

@@ -1,60 +1,10 @@
 /*
- * coke - CLI tool to disable sleep on macOS
+ * coke - prevent idle sleep and request a lid-close sleep override on macOS.
  *
- * Keeps your MacBook awake — whether the lid is open or closed —
- * without requiring a power adapter, external display, or keyboard/mouse.
- *
- * Usage:
- *   coke          Run in foreground, disable sleep
- *   coke off      Re-enable clamshell sleep (manual cleanup)
- *   coke status   Show current state
- *   coke version  Show version
- *
- * On clean exit (Ctrl+C, SIGTERM, SIGHUP), the clamshell flag is
- * reset and the idle assertion released. If the lid is closed at
- * that moment, the machine will go to sleep immediately — a laptop
- * left awake in a bag with no display is a thermal hazard.
- *
- * On crash or SIGKILL, the idle assertion is auto-released by the
- * kernel, but the clamshell flag remains set until coke off or
- * reboot.
- *
- * This behavior is a consequence of the kernel design: the XNU
- * IOPMrootDomain evaluates clamshell sleep policy inline with the
- * flag change (setClamShellSleepDisable → handlePowerNotification →
- * shouldSleepOnClamshellClosed). There is no userspace mechanism to
- * clear the flag without triggering this evaluation. Amphetamine
- * (CDMManager) uses the same API and has the same behavior.
- *
- * How it works:
- *   Two mechanisms prevent sleep:
- *
- *   1. Clamshell sleep (lid close): IOKit API kPMSetClamshellSleepState
- *      sets the kernel's clamshellSleepDisableMask (bit
- *      kClamshellSleepDisablePowerd). The flag is globally sticky —
- *      RootDomainUserClient::clientClose does not undo it, so it
- *      persists across connection open/close. No root or entitlement
- *      required (kIOUserClientEntitlementsKey = false, no
- *      clientHasPrivilege gate on this selector). Re-asserted every
- *      second to recover if another tool clears it.
- *
- *   2. Idle sleep (lid open): An IOPMAssertion of type
- *      kIOPMAssertionTypePreventUserIdleSystemSleep (same as
- *      caffeinate -i). Per-process, auto-released by the kernel on
- *      process death — no coordination needed, no orphan risk.
- *
- * Multi-instance coordination:
- *   flock() shared/exclusive locks on a per-user temp file ensure
- *   the kernel flag is only cleared when the last instance exits.
- *   Crash recovery: flock is auto-released on process death.
- *   The clamshell flag may remain set until coke off or reboot.
- *
- * Safety:
- *   - Clean exit (Ctrl+C, SIGTERM, SIGHUP) always resets kernel state
- *   - SIGKILL or crash leaves the clamshell flag set until coke off or reboot
- *   - Thermal throttling and emergency shutdown (SMC) remain active
- *   - User-initiated sleep (power button, Apple menu) still works
- *   - State resets automatically on reboot
+ * The idle assertion belongs to this process; the clamshell bit does not.
+ * Machine-wide locks coordinate cooperating coke processes, but cannot make
+ * the shared bit atomic with powerd. Power/display transitions can still
+ * initiate sleep before our next retry. See README.md for these limitations.
  */
 
 #ifndef COKE_VERSION
@@ -70,6 +20,9 @@
 #include <errno.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/select.h>
+#include <sys/wait.h>
+#include <spawn.h>
 
 #include <mach/mach.h>
 #include <IOKit/IOKitLib.h>
@@ -79,60 +32,24 @@
 #include <CoreGraphics/CoreGraphics.h>
 #include <IOKit/ps/IOPowerSources.h>
 
-#define LOCK_FILENAME "coke.lock"
-#define LOCK_PATH_MAX 256
+extern char **environ;
 
-/*
- * Build the lock file path using confstr(_CS_DARWIN_USER_TEMP_DIR),
- * which queries the kernel for the per-user temp directory rather than
- * trusting the environment ($TMPDIR can be poisoned). Returns NULL on
- * failure rather than falling back to /tmp (world-writable, DoS-prone).
- *
- * The per-user temp dir on macOS (e.g. /var/folders/xx/.../T/) is
- * owned by the user and not world-writable.
- */
-static char lock_path[LOCK_PATH_MAX];
-
-static const char *get_lock_path(void)
-{
-    if (lock_path[0] != '\0')
-        return lock_path;
-
-    char tmpdir[LOCK_PATH_MAX];
-    size_t len = confstr(_CS_DARWIN_USER_TEMP_DIR, tmpdir, sizeof(tmpdir));
-
-    /* confstr returns total size including NUL. len==0 means error,
-     * len==1 means empty string — reject both to prevent a size_t
-     * underflow in the strlen(tmpdir)-1 trailing-slash check below. */
-    if (len <= 1 || len > sizeof(tmpdir)) {
-        fprintf(stderr, "coke: confstr(_CS_DARWIN_USER_TEMP_DIR) failed; "
-                "cannot determine safe temp directory\n");
-        return NULL;
-    }
-
-    int n = snprintf(lock_path, sizeof(lock_path), "%s%s%s",
-                     tmpdir,
-                     (tmpdir[strlen(tmpdir) - 1] == '/') ? "" : "/",
-                     LOCK_FILENAME);
-
-    if (n < 0 || (size_t)n >= sizeof(lock_path)) {
-        fprintf(stderr, "coke: lock path too long\n");
-        lock_path[0] = '\0'; /* prevent stale truncated path on next call */
-        return NULL;
-    }
-
-    return lock_path;
-}
+/* Read-only lock files allow every account to participate without root.
+ * Never unlink them: replacing an inode would split the set of lock holders.
+ * The fixed, root-owned sticky directory prevents other users removing them.
+ * As with all advisory locks, the creator/root must not remove active files. */
+static const char *control_path = "/private/tmp/com.maltekliemann.coke.control.lock";
+static const char *sessions_path = "/private/tmp/com.maltekliemann.coke.sessions.lock";
 
 /* ---------- IOKit clamshell API ---------- */
 
 /*
- * Toggle the kernel's clamshellSleepDisabled flag via IOPMrootDomain.
+ * Toggle the powerd bit in clamshellSleepDisableMask via IOPMrootDomain.
  *
  * Opens a user client connection to IOPMrootDomain (the top-level power
  * management driver) and calls selector kPMSetClamshellSleepState.
  * This is idempotent — calling with the same value is a no-op in the
- * kernel. No root or entitlement required (see file header).
+ * kernel. No root or entitlement required.
  */
 static IOReturn set_clamshell_sleep_disabled(bool disable)
 {
@@ -191,7 +108,7 @@ static int read_bool_property(io_service_t service, CFStringRef key, bool *out)
  *   lid_closed:   AppleClamshellState      — is the lid physically closed?
  *   causes_sleep: AppleClamshellCausesSleep — will closing the lid sleep?
  * Either output pointer may be NULL to skip that query.
- * Returns 0 on success, -1 if IOPMrootDomain is not found.
+ * Returns 0 on success, -1 if the service or a requested property is absent.
  */
 static int get_clamshell_state(bool *lid_closed, bool *causes_sleep)
 {
@@ -200,314 +117,492 @@ static int get_clamshell_state(bool *lid_closed, bool *causes_sleep)
     if (service == IO_OBJECT_NULL)
         return -1;
 
-    if (lid_closed) {
-        if (!read_bool_property(service, CFSTR("AppleClamshellState"), lid_closed))
-            *lid_closed = false;
-    }
-
-    if (causes_sleep) {
-        if (!read_bool_property(service, CFSTR("AppleClamshellCausesSleep"), causes_sleep))
-            *causes_sleep = true; /* default: lid close causes sleep */
-    }
-
+    int result = 0;
+    if (lid_closed && !read_bool_property(service, CFSTR("AppleClamshellState"), lid_closed))
+        result = -1;
+    if (causes_sleep && !read_bool_property(service, CFSTR("AppleClamshellCausesSleep"), causes_sleep))
+        result = -1;
     IOObjectRelease(service);
-    return 0;
+    return result;
 }
 
-/* ---------- Environment checks ---------- */
+/* ---------- Restoration policy ---------- */
 
-/*
- * Returns true if at least one non-built-in (external) display is online.
- */
-static bool has_external_display(void)
+/* Return 1/0 for yes/no, -1 if the environment cannot be queried. */
+static int has_external_display(void)
 {
-    CGDirectDisplayID displays[8];
     uint32_t count = 0;
-
-    if (CGGetOnlineDisplayList(8, displays, &count) != kCGErrorSuccess)
-        return false;
-
-    for (uint32_t i = 0; i < count; i++) {
-        if (!CGDisplayIsBuiltin(displays[i]))
-            return true;
+    if (CGGetOnlineDisplayList(0, NULL, &count) != kCGErrorSuccess)
+        return -1;
+    if (!count)
+        return 0;
+    CGDirectDisplayID *displays = calloc(count, sizeof(*displays));
+    if (!displays)
+        return -1;
+    int result = 0;
+    if (CGGetOnlineDisplayList(count, displays, &count) != kCGErrorSuccess) {
+        result = -1;
+    } else {
+        for (uint32_t i = 0; i < count; i++) {
+            if (!CGDisplayIsBuiltin(displays[i]))
+                result = 1;
+        }
     }
-    return false;
+    free(displays);
+    return result;
 }
 
-/*
- * Returns true if the system is running on AC (wall) power.
- */
-static bool is_on_ac_power(void)
+static int is_on_ac_power(void)
 {
     CFTypeRef info = IOPSCopyPowerSourcesInfo();
     if (!info)
-        return false;
-
+        return -1;
     CFStringRef source = IOPSGetProvidingPowerSourceType(info);
-    bool ac = source && CFStringCompare(source, CFSTR(kIOPMACPowerKey), 0) == kCFCompareEqualTo;
+    int result = source ? CFEqual(source, CFSTR(kIOPMACPowerKey)) : -1;
     CFRelease(info);
-    return ac;
+    return result;
 }
 
-/* ---------- flock-based coordination ---------- */
+static void check_lid_assertions(const void *key, const void *value, void *context)
+{
+    (void)key;
+    int *result = context;
+    if (CFGetTypeID(value) != CFArrayGetTypeID()) {
+        if (*result != 1)
+            *result = -1;
+        return;
+    }
+    CFArrayRef assertions = value;
+    for (CFIndex i = 0; i < CFArrayGetCount(assertions); i++) {
+        CFDictionaryRef assertion = CFArrayGetValueAtIndex(assertions, i);
+        if (CFGetTypeID(assertion) != CFDictionaryGetTypeID()) {
+            if (*result != 1)
+                *result = -1;
+            continue;
+        }
+        CFTypeRef level = CFDictionaryGetValue(assertion, kIOPMAssertionLevelKey);
+        int active = 0;
+        if (!level || CFGetTypeID(level) != CFNumberGetTypeID() ||
+            !CFNumberGetValue(level, kCFNumberIntType, &active)) {
+            if (*result != 1)
+                *result = -1;
+            continue;
+        }
+        /* Read the private property names without creating privileged assertions. */
+        if (active &&
+            (CFDictionaryGetValue(assertion, CFSTR("AppliesOnLidClose")) == kCFBooleanTrue ||
+             CFDictionaryGetValue(assertion, CFSTR("ProcessingHotPlug")) == kCFBooleanTrue))
+            *result = 1;
+    }
+}
 
-/*
- * Locking protocol
- * ================
- * Multiple coke instances coordinate through a single lock file using
- * flock() shared and exclusive locks:
- *
- *   Running instance:  holds LOCK_SH for its entire lifetime.
- *   Clean shutdown:    tries to upgrade LOCK_SH → LOCK_EX (non-blocking).
- *                      If it succeeds, this was the last instance — reset
- *                      the kernel flag. If it fails, other instances are
- *                      still running — do nothing.
- *   Crash:             flock is released automatically when a process dies
- *                      (fd closed by kernel). The clamshell flag remains
- *                      set until coke off or reboot.
- *
- * Key invariant: a running instance ALWAYS holds at least LOCK_SH.
- * This guarantees that LOCK_EX succeeds only when no instances are alive.
- */
+static int restore_clamshell_sleep(void)
+{
+    int external = has_external_display();
+    int ac = is_on_ac_power();
+    int lid_assertion = 0;
+    CFDictionaryRef assertions = NULL;
+    IOReturn ret = IOPMCopyAssertionsByProcess(&assertions);
+    if (ret == kIOReturnSuccess && assertions &&
+        CFGetTypeID(assertions) == CFDictionaryGetTypeID()) {
+        CFDictionaryApplyFunction(assertions, check_lid_assertions, &lid_assertion);
+    } else {
+        lid_assertion = -1;
+    }
+    if (assertions)
+        CFRelease(assertions);
 
-static int lock_fd = -1;
+    if ((external == 1 && ac == 1) || lid_assertion == 1) {
+        fprintf(stderr, "coke: macOS clamshell policy active; override left intact\n");
+        return 0;
+    }
+    if (external < 0 || ac < 0 || lid_assertion < 0) {
+        fprintf(stderr, "coke: cannot determine macOS clamshell policy; override left intact; retry coke off\n");
+        return 1;
+    }
+    if (set_clamshell_sleep_disabled(false) != kIOReturnSuccess) {
+        fprintf(stderr, "coke: failed to restore clamshell sleep; retry coke off\n");
+        return 1;
+    }
+    fprintf(stderr, "coke: clamshell sleep override cleared\n");
+    return 0;
+}
+
+/* ---------- Machine-wide coordination ---------- */
+
+static int control_fd = -1;
+static int sessions_fd = -1;
+static bool session_started;
 static IOPMAssertionID idle_assertion = kIOPMNullAssertionID;
 
-/*
- * Try to acquire an exclusive lock (non-blocking).
- * Returns 1 if acquired (no other instances alive), 0 if not.
- */
-static int try_exclusive_lock(int fd)
+static int open_lock_file(const char *path)
 {
-    return flock(fd, LOCK_EX | LOCK_NB) == 0;
-}
-
-/*
- * Acquire a shared lock (blocking, but shared locks don't block each other).
- */
-static int acquire_shared_lock(int fd)
-{
-    return flock(fd, LOCK_SH) == 0;
-}
-
-/*
- * Open the lock file safely:
- *   - O_NOFOLLOW: refuse to follow symlinks
- *   - 0600: user-only permissions
- *   - Verify the opened file is a regular file we own
- */
-static int open_lock_file(void)
-{
-    const char *path = get_lock_path();
-    if (!path)
-        return -1;
-    int fd = open(path, O_CREAT | O_RDWR | O_NOFOLLOW, 0600);
+    /* Explicitly set mode despite umask so another account can open the file.
+     * There is no data in either file. Locks work on read-only descriptors. */
+    mode_t previous_umask = umask(0);
+    int fd = open(path, O_CREAT | O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK, 0444);
+    int saved_errno = errno;
+    umask(previous_umask);
+    errno = saved_errno;
     if (fd < 0) {
-        fprintf(stderr, "coke: failed to open lock file %s: %s\n",
-                path, strerror(errno));
+        fprintf(stderr, "coke: cannot open lock %s: %s\n", path, strerror(errno));
         return -1;
     }
-
-    /* Verify the file is a regular file owned by us with safe permissions */
-    struct stat st;
-    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_uid != getuid()) {
-        fprintf(stderr, "coke: lock file %s has unexpected owner or type\n", path);
+    struct stat st, named;
+    if (fstat(fd, &st) < 0 || lstat(path, &named) < 0 ||
+        !S_ISREG(st.st_mode) || st.st_nlink != 1 ||
+        (st.st_mode & 07777) != 0444 ||
+        st.st_dev != named.st_dev || st.st_ino != named.st_ino) {
+        fprintf(stderr, "coke: unsafe or replaced lock file: %s\n", path);
         close(fd);
         return -1;
     }
-    if ((st.st_mode & 0777) != 0600) {
-        /* Someone created the file with lax permissions — refuse it */
-        fprintf(stderr, "coke: lock file %s has unsafe permissions %04o (expected 0600)\n",
-                path, st.st_mode & 0777);
-        close(fd);
-        return -1;
-    }
-
     return fd;
 }
 
-/*
- * Called on clean exit (Ctrl+C, SIGTERM, SIGHUP, or atexit).
- *
- * The two sleep mechanisms have different cleanup needs:
- *   - Idle assertion: per-process, released here but also auto-released
- *     by the kernel on crash — no orphan risk.
- *   - Clamshell flag: global, shared across instances. Only the last
- *     instance (the one that successfully upgrades to LOCK_EX) resets it.
- */
-static void cleanup_on_exit(void)
+static int lock_control(void)
 {
-    if (lock_fd < 0)
-        return;
-
-    /* Release idle sleep assertion (per-process, no coordination needed) */
-    if (idle_assertion != kIOPMNullAssertionID) {
-        IOPMAssertionRelease(idle_assertion);
-        idle_assertion = kIOPMNullAssertionID;
-    }
-
-    /*
-     * Try to upgrade our shared lock to exclusive (non-blocking).
-     * On macOS/BSD flock: if other shared holders exist, this fails
-     * with EWOULDBLOCK and our shared lock stays in place. If we're
-     * the only holder, it atomically upgrades — no gap, no race.
-     */
-    if (try_exclusive_lock(lock_fd)) {
-        /*
-         * Only clear the kernel's clamshellSleepDisableMask if powerd
-         * wouldn't have it set. Powerd sets the same bit (0x02) when
-         * in desktop mode (external display + AC). Clearing it would
-         * desync powerd's internal state — it tracks the bit and won't
-         * re-send until its own state transitions zero↔non-zero.
-         */
-        if (has_external_display() && is_on_ac_power()) {
-            fprintf(stderr, "coke: last instance exiting, clamshell mode active — mask left intact\n");
-        } else {
-            set_clamshell_sleep_disabled(false);
-            fprintf(stderr, "coke: last instance exiting, clamshell sleep re-enabled\n");
-        }
-    }
-
-    close(lock_fd);
-    lock_fd = -1;
+    int ret;
+    do {
+        ret = flock(control_fd, LOCK_EX);
+    } while (ret < 0 && errno == EINTR);
+    if (ret < 0)
+        fprintf(stderr, "coke: cannot acquire control lock: %s\n", strerror(errno));
+    return ret;
 }
 
-/* ---------- Signal handling ---------- */
+/* Return 1 if exclusive, 0 if another holder exists, -1 on an actual error. */
+static int try_exclusive_lock(int fd)
+{
+    if (flock(fd, LOCK_EX | LOCK_NB) == 0)
+        return 1;
+    if (errno == EWOULDBLOCK)
+        return 0;
+    fprintf(stderr, "coke: cannot inspect session lock: %s\n", strerror(errno));
+    return -1;
+}
 
-/*
- * Signal strategy: set a flag and let the main loop exit gracefully.
- * The handler only writes to a volatile sig_atomic_t (async-signal-safe).
- * sleep(1) in the main loop returns early on EINTR, so the flag is
- * checked within ~1 second of signal delivery.
- *
- * SIGKILL cannot be caught — in that case the OS closes our fd
- * (releasing the flock). The clamshell flag remains set until
- * coke off or reboot.
- */
-static volatile sig_atomic_t should_exit = 0;
+static void close_locks(void)
+{
+    if (sessions_fd >= 0)
+        close(sessions_fd);
+    if (control_fd >= 0)
+        close(control_fd);
+    sessions_fd = control_fd = -1;
+}
+
+static int open_locks(void)
+{
+    control_fd = open_lock_file(control_path);
+    if (control_fd < 0)
+        return 1;
+    sessions_fd = open_lock_file(sessions_path);
+    if (sessions_fd < 0) {
+        close_locks();
+        return 1;
+    }
+    return 0;
+}
+
+static int cleanup_session(void)
+{
+    int failed = 0;
+    if (sessions_fd >= 0 && session_started) {
+        if (lock_control() < 0) {
+            fprintf(stderr, "coke: cleanup could not coordinate; override may remain set\n");
+            failed = 1;
+        } else {
+            /* Serialize the upgrade AND close: concurrent exits cannot both
+             * fail their upgrades while each still holds a shared lock. Starts,
+             * status and off also acquire control before touching sessions. */
+            int last = try_exclusive_lock(sessions_fd);
+            if (last == 1)
+                failed = restore_clamshell_sleep();
+            else if (last < 0)
+                failed = 1;
+        }
+    }
+    session_started = false;
+    close_locks(); /* closes sessions before releasing control */
+    if (idle_assertion != kIOPMNullAssertionID) {
+        IOReturn ret = IOPMAssertionRelease(idle_assertion);
+        idle_assertion = kIOPMNullAssertionID;
+        if (ret != kIOReturnSuccess) {
+            fprintf(stderr, "coke: idle assertion release failed: 0x%x\n", ret);
+            failed = 1;
+        }
+    }
+    return failed;
+}
+
+static void cleanup_on_exit(void)
+{
+    (void)cleanup_session();
+}
+
+static int start_session(void)
+{
+    if (open_locks() || lock_control() < 0)
+        return 1;
+    if (flock(sessions_fd, LOCK_SH) < 0) {
+        fprintf(stderr, "coke: cannot acquire session lock: %s\n", strerror(errno));
+        return 1;
+    }
+    /* Do not change global state unless the idle assertion succeeded. */
+    IOReturn ret = IOPMAssertionCreateWithName(
+        kIOPMAssertionTypePreventUserIdleSystemSleep, kIOPMAssertionLevelOn,
+        CFSTR("coke: preventing idle sleep"), &idle_assertion);
+    if (ret != kIOReturnSuccess) {
+        fprintf(stderr, "coke: cannot prevent idle sleep: 0x%x\n", ret);
+        return 1;
+    }
+    if (set_clamshell_sleep_disabled(true) != kIOReturnSuccess)
+        return 1;
+    session_started = true;
+    if (flock(control_fd, LOCK_UN) < 0) {
+        fprintf(stderr, "coke: cannot release control lock: %s\n", strerror(errno));
+        return 1;
+    }
+    fprintf(stderr, "coke: idle sleep prevented; lid-close override requested (pid %d)\n", getpid());
+    return 0;
+}
+
+/* ---------- Signals and command supervision ---------- */
+
+static volatile sig_atomic_t pending_signals;
+static sigset_t watched_signals;
+static sigset_t original_mask;
+static const int forwarded_signals[] = { SIGINT, SIGTERM, SIGHUP };
 
 static void handle_signal(int sig)
 {
-    (void)sig;
-    should_exit = 1;
+    pending_signals |= (sig_atomic_t)(1U << sig);
 }
 
-static void install_signal_handlers(void)
+static int install_signal_handlers(void)
 {
-    struct sigaction sa;
+    sigemptyset(&watched_signals);
+    for (size_t i = 0; i < sizeof(forwarded_signals) / sizeof(forwarded_signals[0]); i++)
+        sigaddset(&watched_signals, forwarded_signals[i]);
+    sigaddset(&watched_signals, SIGCHLD);
+    struct sigaction sa = {0};
     sa.sa_handler = handle_signal;
-    sa.sa_flags = 0;
-    sigemptyset(&sa.sa_mask);
-
-    sigaction(SIGINT,  &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
-    sigaction(SIGHUP,  &sa, NULL);
+    sa.sa_mask = watched_signals;
+    for (int sig = 1; sig < NSIG; sig++) {
+        if (!sigismember(&watched_signals, sig))
+            continue;
+        struct sigaction old;
+        if (sigaction(sig, NULL, &old) < 0)
+            return 1;
+        /* Preserve nohup/background-shell signal dispositions. SIGCHLD must
+         * be catchable so we can reap and return the command's status. */
+        if (old.sa_handler == SIG_IGN && sig != SIGCHLD)
+            continue;
+        if (sigaction(sig, &sa, NULL) < 0)
+            return 1;
+    }
+    return sigprocmask(SIG_SETMASK, NULL, &original_mask) < 0;
 }
 
-/* ---------- Commands ---------- */
-
-/*
- * Main entry point. Acquires a shared lock, disables clamshell sleep,
- * creates an idle sleep assertion, then loops re-asserting the clamshell
- * flag every second until signaled. On exit, releases the assertion and
- * (if last instance) resets the clamshell flag.
- */
-static int cmd_run(void)
+static int status_code(int status)
 {
-    lock_fd = open_lock_file();
-    if (lock_fd < 0)
-        return 1;
-
-    /* Register cleanup so it runs on exit() from any code path (e.g.,
-     * a library calling exit(), or a future early-return we forget to
-     * guard). cleanup_on_exit is idempotent (checks lock_fd < 0), so
-     * the explicit call at the end of cmd_run + this atexit is safe. */
-    atexit(cleanup_on_exit);
-    install_signal_handlers();
-
-    if (!acquire_shared_lock(lock_fd)) {
-        if (!should_exit) {
-            fprintf(stderr, "coke: failed to acquire shared lock: %s\n",
-                    strerror(errno));
-        }
-        close(lock_fd);
-        lock_fd = -1;
-        return should_exit ? 0 : 1;
-    }
-
-    /* Disable clamshell sleep */
-    IOReturn ret = set_clamshell_sleep_disabled(true);
-    if (ret != kIOReturnSuccess) {
-        close(lock_fd);
-        lock_fd = -1;
-        return 1;
-    }
-
-    /* Prevent idle system sleep (like caffeinate -i).
-     * Each process holds its own assertion — the kernel auto-releases
-     * it if the process dies, so no multi-instance coordination needed. */
-    ret = IOPMAssertionCreateWithName(
-        kIOPMAssertionTypePreventUserIdleSystemSleep,
-        kIOPMAssertionLevelOn,
-        CFSTR("coke: preventing idle sleep"),
-        &idle_assertion);
-    if (ret != kIOReturnSuccess) {
-        fprintf(stderr, "coke: warning: failed to create idle sleep assertion: 0x%x\n", ret);
-        /* Non-fatal: clamshell sleep prevention still works */
-    }
-
-    fprintf(stderr, "coke: sleep disabled (pid %d)\n", getpid());
-    fprintf(stderr, "coke: press Ctrl+C to stop\n");
-
-    /* Re-assert every second to recover if another tool clears the flag */
-    while (!should_exit) {
-        sleep(1);
-        if (!should_exit)
-            set_clamshell_sleep_disabled(true);
-    }
-
-    fprintf(stderr, "\ncoke: shutting down...\n");
-    cleanup_on_exit();
-    return 0;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
 }
 
-/*
- * Manually re-enable clamshell sleep. Refuses to run while instances
- * are active (they would re-assert within 1 second, making it futile).
- * Holds LOCK_EX across the IOKit call to prevent a new instance from
- * starting and re-disabling between our check and our disable.
- */
+static int set_foreground(int tty, pid_t group)
+{
+    sigset_t block, previous;
+    sigemptyset(&block);
+    sigaddset(&block, SIGTTOU);
+    if (sigprocmask(SIG_BLOCK, &block, &previous) < 0)
+        return -1;
+    int result = tcsetpgrp(tty, group);
+    int saved_errno = errno;
+    sigprocmask(SIG_SETMASK, &previous, NULL);
+    errno = saved_errno;
+    return result;
+}
+
+/* Only hand off a terminal owned by the expected group. A job resumed with
+ * bg must not steal the foreground terminal from the shell. */
+static int move_foreground(int tty, pid_t from, pid_t to)
+{
+    if (tty < 0)
+        return 0;
+    pid_t foreground = tcgetpgrp(tty);
+    if (foreground < 0)
+        return -1;
+    return foreground == from ? set_foreground(tty, to) : 0;
+}
+
+static int run_command(char **command, pid_t *child, int *tty)
+{
+    posix_spawnattr_t attr;
+    int error = posix_spawnattr_init(&attr);
+    if (error)
+        goto fail;
+    /* A separate group lets signals sent to coke reach the command's children.
+     * Start suspended so an interactive command cannot read before handoff. */
+    error = posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP |
+        POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_START_SUSPENDED);
+    if (!error)
+        error = posix_spawnattr_setpgroup(&attr, 0);
+    if (!error)
+        error = posix_spawnattr_setsigmask(&attr, &original_mask);
+    if (!error)
+        error = posix_spawnp(child, command[0], NULL, &attr, command, environ);
+    posix_spawnattr_destroy(&attr);
+    if (error)
+        goto fail;
+
+    int status;
+    pid_t waited;
+    do {
+        waited = waitpid(*child, &status, WUNTRACED);
+    } while (waited < 0 && errno == EINTR);
+    if (waited < 0) {
+        fprintf(stderr, "coke: cannot wait for command startup: %s\n", strerror(errno));
+        kill(-*child, SIGKILL);
+        while (waitpid(*child, NULL, 0) < 0 && errno == EINTR) {}
+        *child = -1;
+        return 1;
+    }
+    if (!WIFSTOPPED(status)) {
+        *child = -1;
+        return status_code(status);
+    }
+
+    *tty = open("/dev/tty", O_RDWR | O_NOCTTY | O_CLOEXEC);
+    if (move_foreground(*tty, getpgrp(), *child) < 0) {
+        fprintf(stderr, "coke: cannot give command the terminal: %s\n", strerror(errno));
+        kill(-*child, SIGKILL);
+        while (waitpid(*child, NULL, 0) < 0 && errno == EINTR) {}
+        *child = -1;
+        return 1;
+    }
+    kill(-*child, SIGCONT);
+    return 0;
+fail:
+    fprintf(stderr, "coke: cannot execute %s: %s\n", command[0], strerror(error));
+    return error == ENOENT ? 127 : 126;
+}
+
+static int supervise(pid_t child, int tty)
+{
+    int failed = 0;
+    if (sigprocmask(SIG_BLOCK, &watched_signals, NULL) < 0)
+        return 1;
+    for (;;) {
+        sig_atomic_t pending = pending_signals;
+        pending_signals = 0;
+        for (size_t i = 0; i < sizeof(forwarded_signals) / sizeof(forwarded_signals[0]); i++) {
+            int sig = forwarded_signals[i];
+            if (pending & (sig_atomic_t)(1U << sig)) {
+                if (child < 0) {
+                    sigprocmask(SIG_SETMASK, &original_mask, NULL);
+                    return 128 + sig;
+                }
+                kill(-child, sig);
+                kill(-child, SIGCONT); /* let a stopped child handle termination */
+            }
+        }
+        if (child > 0) {
+            int status;
+            pid_t result = waitpid(child, &status, WNOHANG | WUNTRACED);
+            if (result < 0 && errno != EINTR) {
+                fprintf(stderr, "coke: waitpid failed: %s\n", strerror(errno));
+                sigprocmask(SIG_SETMASK, &original_mask, NULL);
+                return 1;
+            }
+            if (result > 0) {
+                if (WIFSTOPPED(status)) {
+                    if (move_foreground(tty, child, getpgrp()) < 0)
+                        failed = 1;
+                    /* Let the invoking shell observe the stopped job. */
+                    raise(SIGSTOP);
+                    if (move_foreground(tty, getpgrp(), child) < 0)
+                        failed = 1;
+                    kill(-child, SIGCONT);
+                } else {
+                    int code = status_code(status);
+                    sigprocmask(SIG_SETMASK, &original_mask, NULL);
+                    return code ? code : failed;
+                }
+            }
+        }
+        struct timespec timeout = { .tv_sec = 1 };
+        int result = pselect(0, NULL, NULL, NULL, &timeout, &original_mask);
+        if (result < 0 && errno != EINTR) {
+            fprintf(stderr, "coke: cannot wait for signals: %s\n", strerror(errno));
+            sigprocmask(SIG_SETMASK, &original_mask, NULL);
+            return 1;
+        }
+        if (result == 0 && set_clamshell_sleep_disabled(true) != kIOReturnSuccess) {
+            if (!failed)
+                fprintf(stderr, "coke: lid-close protection failed; %s\n",
+                        child < 0 ? "stopping" : "continuing to retry");
+            failed = 1;
+            if (child < 0) {
+                sigprocmask(SIG_SETMASK, &original_mask, NULL);
+                return 1;
+            }
+        }
+    }
+}
+
+static int cmd_run(char **command)
+{
+    if (atexit(cleanup_on_exit) != 0 || install_signal_handlers()) {
+        fprintf(stderr, "coke: cannot install cleanup or signal handlers\n");
+        return 1;
+    }
+    int code = start_session();
+    pid_t child = -1;
+    int tty = -1;
+    if (!code) {
+        if (pending_signals) {
+            for (size_t i = 0; i < sizeof(forwarded_signals) / sizeof(forwarded_signals[0]); i++) {
+                int sig = forwarded_signals[i];
+                if (pending_signals & (sig_atomic_t)(1U << sig)) {
+                    code = 128 + sig;
+                    break;
+                }
+            }
+        }
+        if (!code && command)
+            code = run_command(command, &child, &tty);
+        if (!code && (!command || child > 0))
+            code = supervise(child, tty);
+    }
+    if (tty >= 0) {
+        if (move_foreground(tty, child, getpgrp()) < 0) {
+            fprintf(stderr, "coke: cannot restore terminal foreground group: %s\n", strerror(errno));
+            if (!code)
+                code = 1;
+        }
+        close(tty);
+    }
+    if (cleanup_session() && !code)
+        code = 1;
+    return code;
+}
+
 static int cmd_off(void)
 {
-    int fd = open_lock_file();
-    if (fd < 0) {
-        fprintf(stderr, "coke: warning: cannot check for running instances\n");
-    } else if (!try_exclusive_lock(fd)) {
-        close(fd);
-        fprintf(stderr, "coke: instances are still running — stop them first (kill or Ctrl+C)\n");
+    if (open_locks() || lock_control() < 0) {
+        close_locks();
         return 1;
     }
-    /* Hold exclusive lock (if acquired) while we disable — prevents a new
-     * instance from starting and calling set_clamshell_sleep_disabled(true)
-     * between our check and our disable call. */
-
-    IOReturn ret = set_clamshell_sleep_disabled(false);
-
-    if (fd >= 0)
-        close(fd); /* release exclusive lock */
-
-    if (ret != kIOReturnSuccess)
-        return 1;
-
-    fprintf(stderr, "coke: clamshell sleep re-enabled\n");
-    return 0;
+    int exclusive = try_exclusive_lock(sessions_fd);
+    int code = 1;
+    if (exclusive == 0)
+        fprintf(stderr, "coke: instances are still running; stop them first\n");
+    else if (exclusive == 1)
+        code = restore_clamshell_sleep();
+    close_locks();
+    return code;
 }
 
-/*
- * Print current lid state, clamshell sleep override, and whether any
- * coke instances are running. Uses the lock file to detect instances:
- * if LOCK_EX succeeds, no instances hold LOCK_SH, so none are alive.
- */
 static int cmd_status(void)
 {
     bool lid_closed, causes_sleep;
@@ -515,64 +610,62 @@ static int cmd_status(void)
         fprintf(stderr, "coke: failed to read clamshell state\n");
         return 1;
     }
-
-    /* Check if any coke instances are running. Probe with a non-blocking
-     * exclusive lock. Briefly holds LOCK_EX until close() — a concurrent
-     * coke startup's acquire_shared_lock would block for this duration. */
-    int fd = open_lock_file();
-    bool instances_running = false;
-    if (fd >= 0) {
-        if (!try_exclusive_lock(fd))
-            instances_running = true;
-        close(fd);
+    if (open_locks() || lock_control() < 0) {
+        close_locks();
+        return 1;
     }
-
-    printf("lid:              %s\n", lid_closed ? "closed" : "open");
-    printf("clamshell sleep:  %s\n", causes_sleep ? "enabled (normal)" : "disabled (overridden)");
-    printf("coke running:     %s\n", instances_running ? "yes" : "no");
-
+    int exclusive = try_exclusive_lock(sessions_fd);
+    close_locks();
+    if (exclusive < 0)
+        return 1;
+    printf("lid:                  %s\n", lid_closed ? "closed" : "open");
+    printf("lid sleep (reported): %s\n", causes_sleep ? "enabled" : "disabled");
+    printf("coke running:         %s (all users)\n", exclusive ? "no" : "yes");
+    printf("The reported lid policy is an OS snapshot, not proof of an active override.\n");
     return 0;
 }
-
-/* ---------- Main ---------- */
 
 static void usage(void)
 {
     fprintf(stderr,
-        "coke - disable sleep on macOS\n"
-        "\n"
+        "coke - prevent idle sleep and request a lid-close sleep override\n\n"
         "usage:\n"
-        "  coke             disable sleep (foreground, Ctrl+C to stop)\n"
-        "  coke off         re-enable clamshell sleep\n"
-        "  coke status      show current state\n"
-        "  coke version     show version\n"
-        "  coke help        show this message\n"
-    );
+        "  coke                  run until interrupted\n"
+        "  coke -- command args  run a command with sleep protection\n"
+        "  coke off              restore clamshell policy (no active instances)\n"
+        "  coke status           show reported lid policy and active instances\n"
+        "  coke version          show version\n"
+        "  coke help             show this message\n");
 }
 
 int main(int argc, char *argv[])
 {
-    if (argc < 2)
-        return cmd_run();
-
+    if (argc == 1)
+        return cmd_run(NULL);
+    if (strcmp(argv[1], "--") == 0) {
+        if (argc > 2)
+            return cmd_run(&argv[2]);
+        fprintf(stderr, "coke: expected a command after --\n");
+        return 2;
+    }
+    if (argc != 2) {
+        fprintf(stderr, "coke: unexpected arguments; use coke -- command args\n");
+        return 2;
+    }
     if (strcmp(argv[1], "off") == 0)
         return cmd_off();
     if (strcmp(argv[1], "status") == 0)
         return cmd_status();
-    if (strcmp(argv[1], "version") == 0 ||
-        strcmp(argv[1], "--version") == 0 ||
+    if (strcmp(argv[1], "version") == 0 || strcmp(argv[1], "--version") == 0 ||
         strcmp(argv[1], "-v") == 0) {
         printf("coke %s\n", COKE_VERSION);
         return 0;
     }
-    if (strcmp(argv[1], "help") == 0 ||
-        strcmp(argv[1], "--help") == 0 ||
+    if (strcmp(argv[1], "help") == 0 || strcmp(argv[1], "--help") == 0 ||
         strcmp(argv[1], "-h") == 0) {
         usage();
         return 0;
     }
-
-    fprintf(stderr, "coke: unknown command '%s'\n", argv[1]);
-    usage();
-    return 1;
+    fprintf(stderr, "coke: unknown command '%s'; use coke -- command args\n", argv[1]);
+    return 2;
 }
